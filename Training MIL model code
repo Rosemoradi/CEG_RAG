@@ -1,0 +1,804 @@
+
+import os, json, random, math, zlib
+from pathlib import Path
+from typing import List, Tuple, Dict, Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
+
+
+# -------------------------
+# CONFIG
+# -------------------------
+SEED = 7
+
+K = 5  # top-k reranked passages per run
+RETRIEVER_MODEL_NAME = "facebook/contriever"
+RERANKER_MODEL_NAME  = "BAAI/bge-reranker-large"  # hidden_size=1024
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---- NQ paths ----
+# Benign RAG data (clean NQ)
+CHUNKS_JSON_PATH_BENIGN = "/workspace/newrags/nqrag/nq_contriever_chunks.json"
+EMB_JSON_PATH_BENIGN    = "/workspace/newrags/nqrag/nq_contriever_embeddings_contriever.json"
+
+# Malicious / poisoned RAG data
+BASE_DIR_MAL = "/workspace/newrags/poisoned_NQ"
+CHUNKS_JSON_PATH_MAL = f"{BASE_DIR_MAL}/nq_contriever_chunks_combined_final_poisoned.json"
+EMB_JSON_PATH_MAL    = f"{BASE_DIR_MAL}/nq_contriever_embeddings_combined2.json"
+
+# Successful poisoned queries file (we take FIRST MAX_NQ)
+QUERY_LIST_PATH = "/workspace/newrags/poisoned_NQ/successful_poisoned_nq.json"
+MAX_NQ = 2000  # cap queries used (set None or 0 for no cap)
+
+# ---- Output folder ----
+OUT_DIR = Path(f"{BASE_DIR_MAL}/nq_MIL_SetTransformer_GATEDONLY_K{K}_v1")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+DATASET_NPZ   = OUT_DIR / f"dataset_with_chunkids_K{K}.npz"
+BEST_CKPT_PTH = OUT_DIR / f"BEST_MIL_SetTransformer_GATEDONLY_K{K}.pth"
+REPORT_JSON   = OUT_DIR / f"test_report_gated_only.json"
+CALIB_JSON    = OUT_DIR / f"calibration.json"
+
+# ---- Build matrices from scratch ----
+BUILD_MATRICES = True
+FORCE_REBUILD  = True  # set False if you want to reuse DATASET_NPZ
+
+# ---- Split ----
+TRAIN_SPLIT = 0.70
+VAL_SPLIT   = 0.15  # remaining is test
+
+# ---- Training ----
+BATCH_SIZE   = 32
+EPOCHS       = 35
+LR           = 2e-4
+WEIGHT_DECAY = 1e-4
+GRAD_CLIP    = 1.0
+
+# ---- Model ----
+D_MODEL  = 256
+N_HEADS  = 8
+N_LAYERS = 3
+DROPOUT  = 0.15
+EMBED_DIM = 128  # for SupCon
+
+# ---- Loss knobs (RUN labels only) ----
+W_DET = 1.0
+
+# Positive coverage (helps chunk TPR but can raise FPR if too strong)
+W_COV   = 0.60
+RHO_COV = 0.55
+
+# Strong benign suppression (main lever for reducing chunk FPR)
+W_NEG_MEAN = 1.20
+W_NEG_MAX  = 0.80
+W_NEG_LSE  = 0.50  # tail penalty on benign
+
+# Prevent attention collapse on positives (useful when many chunks poisoned)
+W_ATTN_ENT = 0.20
+
+# Optional SupCon (still only run labels)
+USE_SUPCON = True
+W_SUPCON   = 0.50
+SUPCON_TAU = 0.2
+
+# ---- Thresholds ----
+THR_DET = 0.5
+
+# Calibrate thr_loc using benign VAL only (no chunk labels), then clamp
+TARGET_CHUNK_FPR_BENIGN_VAL = 0.10
+MIN_THR_LOC = 0.02
+MAX_THR_LOC = 0.98
+
+# Alternative: remove top-r chunks for flagged runs (more stable than thresholds).
+USE_TOPR_INSTEAD_OF_THRESHOLD = False
+TOP_R = 2
+
+# Eval-only GT rule token (edit if your poisoned chunk_id marker differs)
+POISON_ID_SUBSTR = "gpt"
+
+
+# -------------------------
+# Reproducibility
+# -------------------------
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+seed_everything(SEED)
+
+
+# ============================================================
+# JSON / data helpers
+# ============================================================
+def _load_json_or_jsonl(path: str):
+    """
+    Supports:
+      - JSON list file: [ {...}, {...}, ... ]
+      - JSONL file: one JSON object per line
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        txt = f.read().strip()
+    if not txt:
+        return []
+    try:
+        return json.loads(txt)
+    except Exception:
+        out = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                out.append(json.loads(line))
+        return out
+
+def _stable_int_id(x) -> int:
+    """
+    Converts qid-like values to a stable int.
+    If numeric -> int(value). Else -> stable crc32 hash.
+    """
+    if x is None:
+        return 0
+    s = str(x).strip()
+    s2 = s.strip('"').strip("'").strip()
+    if s2.isdigit() or (s2.startswith("-") and s2[1:].isdigit()):
+        return int(s2)
+    return int(zlib.crc32(s2.encode("utf-8")) & 0xffffffff)
+
+def _parse_queries(obj, max_n: int = None) -> list:
+    """
+    NQ successful query items often look like dicts with fields:
+      - qid1 (or qid)   : id
+      - question        : text
+      - success         : true/false (sometimes)
+    We only need (qid, question).
+    """
+    if isinstance(obj, dict):
+        for key in ["data", "items", "queries", "examples"]:
+            if key in obj and isinstance(obj[key], list):
+                obj = obj[key]
+                break
+
+    if not isinstance(obj, list):
+        raise ValueError("QUERY_LIST_PATH must be a JSON list (or JSONL) of objects.")
+
+    out = []
+    for it in obj:
+        if not isinstance(it, dict):
+            continue
+
+        # If there's an explicit success flag and it's false, skip
+        if "success" in it and not bool(it["success"]):
+            continue
+        if "successtrue" in it and not bool(it["successtrue"]):
+            # (just in case your dump used this odd key name)
+            continue
+
+        qid_raw = it.get("qid", it.get("qid1", it.get("query_id", it.get("id", None))))
+        q_raw   = it.get("question", it.get("query", it.get("text", None)))
+
+        if qid_raw is None or q_raw is None:
+            continue
+
+        out.append({"qid": _stable_int_id(qid_raw), "query": str(q_raw)})
+
+        if max_n and max_n > 0 and len(out) >= max_n:
+            break
+
+    if not out:
+        raise ValueError("Could not parse any (qid, question) items from QUERY_LIST_PATH.")
+    return out
+
+def _get_chunk_id(chunk: dict) -> str:
+    for k in ["chunk_id", "id", "_id", "docid", "passage_id"]:
+        if k in chunk:
+            return str(chunk[k])
+    return str(hash(chunk.get("text", "")))
+
+def _l2_normalize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    n = np.linalg.norm(x, axis=-1, keepdims=True)
+    return x / (n + eps)
+
+def _pad_or_truncate_rows(mat: np.ndarray, k: int) -> np.ndarray:
+    mat = np.asarray(mat, dtype=np.float32)
+    if mat.ndim != 2:
+        raise ValueError(f"Expected 2D matrix, got {mat.shape}")
+    if mat.shape[0] == k:
+        return mat
+    if mat.shape[0] > k:
+        return mat[:k, :]
+    pad = np.zeros((k - mat.shape[0], mat.shape[1]), dtype=np.float32)
+    return np.vstack([mat, pad])
+
+def _load_chunks_and_embs(chunks_path: str, emb_path: str):
+    chunks = _load_json_or_jsonl(chunks_path)
+    embs   = _load_json_or_jsonl(emb_path)
+
+    # embeddings may be dict keyed by chunk_id OR list aligned with chunks
+    if isinstance(embs, dict):
+        aligned_chunks = []
+        emb_list = []
+        for ch in chunks:
+            cid = _get_chunk_id(ch)
+            if cid in embs:
+                aligned_chunks.append(ch)
+                emb_list.append(embs[cid])
+        chunks = aligned_chunks
+        P = np.array(emb_list, dtype=np.float32)
+    elif isinstance(embs, list):
+        P = np.array(embs, dtype=np.float32)
+        if P.shape[0] != len(chunks):
+            raise ValueError("Embeddings list length != chunks length.")
+    else:
+        raise ValueError("Unknown embeddings JSON format.")
+
+    P = _l2_normalize(P.astype(np.float32))
+    return chunks, P
+
+
+# ============================================================
+# Build matrices from scratch:
+#   Contriever(q) -> retrieve topK in pre-embedded corpus -> cross-encoder rerank
+#   Extract last-layer [CLS] hidden vector for each (q, p_i)
+# ============================================================
+@torch.no_grad()
+def _mean_pool(last_hidden, mask):
+    mask = mask.unsqueeze(-1)
+    summed = (last_hidden * mask).sum(dim=1)
+    denom = mask.sum(dim=1).clamp(min=1e-6)
+    return summed / denom
+
+@torch.no_grad()
+def encode_query_contriever(query: str, retr_tok, retr_model) -> np.ndarray:
+    inp = retr_tok(query, return_tensors="pt", truncation=True, padding=True, max_length=256).to(DEVICE)
+    out = retr_model(**inp)
+    emb = _mean_pool(out.last_hidden_state, inp["attention_mask"])
+    emb = F.normalize(emb, p=2, dim=-1)
+    return emb.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+def dense_search(q_emb: np.ndarray, P: np.ndarray, top_k: int):
+    sims = P @ q_emb  # cosine if both L2-normalized
+    if top_k >= sims.shape[0]:
+        idxs = np.argsort(-sims)
+    else:
+        idxs = np.argpartition(-sims, top_k-1)[:top_k]
+        idxs = idxs[np.argsort(-sims[idxs])]
+    return idxs.tolist()
+
+@torch.no_grad()
+def rerank_and_get_cls_and_ids(query: str, candidate_chunks: list, rr_tok, rr_model) -> Tuple[np.ndarray, List[str]]:
+    pairs = [[query, c.get("text","")] for c in candidate_chunks]
+    inp = rr_tok(pairs, return_tensors="pt", padding=True, truncation=True, max_length=512).to(DEVICE)
+    out = rr_model(**inp, output_hidden_states=True)
+
+    scores = out.logits.squeeze(-1)         # (K,)
+    last_hidden = out.hidden_states[-1]     # (K,L,H)
+    cls = last_hidden[:, 0, :]              # (K,H)
+
+    order = torch.argsort(scores, descending=True)
+    cls = cls[order]
+
+    cand_ids = [_get_chunk_id(c) for c in candidate_chunks]
+    cand_ids = [cand_ids[i] for i in order.detach().cpu().tolist()]
+
+    return cls.detach().cpu().numpy().astype(np.float32), cand_ids
+
+def build_dataset_npz(force_rebuild: bool = False):
+    if DATASET_NPZ.exists() and not force_rebuild:
+        print(f"[build] dataset exists: {DATASET_NPZ}")
+        return
+
+    print(f"[build] Building matrices from scratch | device={DEVICE} | K={K} | MAX_NQ={MAX_NQ}")
+    retr_tok   = AutoTokenizer.from_pretrained(RETRIEVER_MODEL_NAME)
+    retr_model = AutoModel.from_pretrained(RETRIEVER_MODEL_NAME).to(DEVICE).eval()
+
+    rr_tok   = AutoTokenizer.from_pretrained(RERANKER_MODEL_NAME)
+    rr_model = AutoModelForSequenceClassification.from_pretrained(RERANKER_MODEL_NAME).to(DEVICE).eval()
+
+    D = int(getattr(rr_model.config, "hidden_size", -1))
+    if D <= 0:
+        raise ValueError("Could not read reranker hidden_size.")
+    print(f"[build] Reranker hidden_size D={D}")
+
+    ben_chunks, ben_P = _load_chunks_and_embs(CHUNKS_JSON_PATH_BENIGN, EMB_JSON_PATH_BENIGN)
+    mal_chunks, mal_P = _load_chunks_and_embs(CHUNKS_JSON_PATH_MAL,    EMB_JSON_PATH_MAL)
+
+    queries_raw = _load_json_or_jsonl(QUERY_LIST_PATH)
+    queries = _parse_queries(queries_raw, max_n=MAX_NQ)
+    print(f"[build] queries_used={len(queries)} (we build 2 runs per query => 2*Q runs)")
+
+    X_list, y_list, qid_list, chunkids_list = [], [], [], []
+
+    def run_side(qid: int, query: str, chunks: list, P: np.ndarray, label: int):
+        q_emb = encode_query_contriever(query, retr_tok, retr_model)
+        idxs  = dense_search(q_emb, P, top_k=K)
+        cand  = [chunks[i] for i in idxs]
+
+        cls_mat, reranked_ids = rerank_and_get_cls_and_ids(query, cand, rr_tok, rr_model)  # (K,D)
+        cls_mat = _pad_or_truncate_rows(cls_mat, K)
+
+        X_list.append(cls_mat)
+        y_list.append(label)
+        qid_list.append(qid)
+        chunkids_list.append(reranked_ids)
+
+    for i, it in enumerate(queries, 1):
+        qid, qtext = it["qid"], it["query"]
+
+        run_side(qid, qtext, ben_chunks, ben_P, label=0)  # benign corpus
+        run_side(qid, qtext, mal_chunks, mal_P, label=1)  # malicious corpus
+
+        if i % 100 == 0:
+            print(f"[build] {i}/{len(queries)} queries done")
+
+    X = np.stack(X_list, axis=0).astype(np.float32)      # (N,K,D)
+    y = np.array(y_list, dtype=np.int64)                 # (N,)
+    qids = np.array(qid_list, dtype=np.int64)            # (N,)
+    chunk_ids = np.array(chunkids_list, dtype=object)    # (N,) each is list length K
+
+    # Balance classes for training stability (should already be balanced)
+    idx0 = np.where(y==0)[0]
+    idx1 = np.where(y==1)[0]
+    n = min(len(idx0), len(idx1))
+    rng = np.random.default_rng(SEED)
+    idx0 = rng.choice(idx0, size=n, replace=False)
+    idx1 = rng.choice(idx1, size=n, replace=False)
+    idx = np.concatenate([idx0, idx1])
+    rng.shuffle(idx)
+
+    X = X[idx]; y = y[idx]; qids = qids[idx]; chunk_ids = chunk_ids[idx]
+
+    np.savez_compressed(DATASET_NPZ, X=X, y=y, qids=qids, chunk_ids=chunk_ids)
+    print(f"[build] saved {DATASET_NPZ}")
+    print(f"        X={X.shape} y={y.shape} unique_qids={len(np.unique(qids))}")
+
+
+# ============================================================
+# Split by qid (prevents leakage of same query across splits)
+# ============================================================
+def split_by_qid(qids: np.ndarray, train=0.7, val=0.15, seed=SEED):
+    uq = np.unique(qids)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(uq)
+    n = len(uq)
+    n_tr = int(train*n)
+    n_va = int(val*n)
+
+    tr_q = uq[:n_tr]
+    va_q = uq[n_tr:n_tr+n_va]
+    te_q = uq[n_tr+n_va:]
+
+    tr_mask = np.isin(qids, tr_q)
+    va_mask = np.isin(qids, va_q)
+    te_mask = np.isin(qids, te_q)
+    return tr_mask, va_mask, te_mask
+
+
+# ============================================================
+# SupCon loss (run labels only)
+# ============================================================
+def supervised_contrastive_loss(z: torch.Tensor, y: torch.Tensor, tau: float = 0.2) -> torch.Tensor:
+    B = z.size(0)
+    sim = (z @ z.t()) / max(tau, 1e-6)
+    sim = sim - torch.eye(B, device=z.device) * 1e9
+
+    y = y.view(-1, 1)
+    mask_pos = (y == y.t()).float()
+    mask_pos = mask_pos - torch.eye(B, device=z.device)
+
+    exp_sim = torch.exp(sim)
+    denom = exp_sim.sum(dim=1, keepdim=True).clamp(min=1e-9)
+    log_prob = sim - torch.log(denom)
+
+    pos_count = mask_pos.sum(dim=1).clamp(min=1.0)
+    loss = -(mask_pos * log_prob).sum(dim=1) / pos_count
+    return loss.mean()
+
+
+# ============================================================
+# Model: SetTransformer encoder + per-chunk head + attention MIL pooling
+# ============================================================
+class SetTransformerBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, dropout: float):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.ln1  = nn.LayerNorm(d_model)
+        self.ff   = nn.Sequential(
+            nn.Linear(d_model, 4*d_model),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(4*d_model, d_model),
+        )
+        self.ln2  = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        h, _ = self.attn(x, x, x, need_weights=False)
+        x = self.ln1(x + self.drop(h))
+        h = self.ff(x)
+        x = self.ln2(x + self.drop(h))
+        return x
+
+class AttentionMILPooling(nn.Module):
+    def __init__(self, d_model: int, d_attn: int = 128):
+        super().__init__()
+        self.V = nn.Linear(d_model, d_attn)
+        self.w = nn.Linear(d_attn, 1)
+
+    def forward(self, H):
+        A = self.w(torch.tanh(self.V(H))).squeeze(-1)  # (B,K)
+        a = torch.softmax(A, dim=1)                    # (B,K)
+        bag = (a.unsqueeze(-1) * H).sum(dim=1)         # (B,d)
+        return a, bag
+
+class MIL_SetTransformer_AttnMIL(nn.Module):
+    def __init__(self, D_in: int, d_model: int, n_heads: int, n_layers: int,
+                 dropout: float, embed_dim: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(D_in, d_model),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        self.blocks = nn.ModuleList([
+            SetTransformerBlock(d_model, n_heads, dropout) for _ in range(n_layers)
+        ])
+
+        self.chunk_head = nn.Linear(d_model, 1)
+
+        self.pool = AttentionMILPooling(d_model, d_attn=128)
+        self.run_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+        )
+
+        # For SupCon embedding (run-level)
+        self.emb_head = nn.Sequential(
+            nn.Linear(2*d_model, 2*d_model),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(2*d_model, embed_dim),
+        )
+
+    def forward(self, M):
+        H = self.proj(M)
+        for blk in self.blocks:
+            H = blk(H)
+
+        chunk_logits = self.chunk_head(H).squeeze(-1)  # (B,K)
+        s = torch.sigmoid(chunk_logits)                # (B,K)
+
+        a, bag = self.pool(H)
+        run_logit = self.run_head(bag).squeeze(-1)     # (B,)
+        y_hat = torch.sigmoid(run_logit)
+
+        h_mean = H.mean(dim=1)
+        h_max  = H.max(dim=1).values
+        g = torch.cat([h_mean, h_max], dim=1)          # (B,2d)
+        emb = self.emb_head(g)
+        emb = F.normalize(emb, p=2, dim=1)
+
+        return chunk_logits, s, a, y_hat, emb
+
+
+# ============================================================
+# Dataset
+# ============================================================
+class RunDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = X.astype(np.float32)
+        self.y = y.astype(np.int64)
+    def __len__(self): return len(self.X)
+    def __getitem__(self, idx):
+        return torch.from_numpy(self.X[idx]), torch.tensor(self.y[idx], dtype=torch.long)
+
+
+# ============================================================
+# Metrics + eval-only chunk GT
+# ============================================================
+def _counts_from_preds(y_true: np.ndarray, y_pred: np.ndarray):
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+    tn = int(((y_true == 0) & (y_pred == 0)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+    return tp, tn, fp, fn
+
+def _rates(tp, tn, fp, fn):
+    eps = 1e-9
+    acc  = (tp + tn) / max(tp + tn + fp + fn, 1)
+    tpr  = tp / (tp + fn + eps)
+    fpr  = fp / (fp + tn + eps)
+    prec = tp / (tp + fp + eps)
+    return {"acc": acc, "tpr": tpr, "fpr": fpr, "prec": prec}
+
+def _chunk_gt_eval_only(y_run: np.ndarray, chunk_ids_obj: np.ndarray) -> np.ndarray:
+    """
+    Eval-only chunk GT:
+      - benign runs: all 0
+      - malicious runs: chunk=1 if POISON_ID_SUBSTR in chunk_id (case-insensitive)
+    """
+    N = len(y_run)
+    gt = np.zeros((N, K), dtype=np.int64)
+    needle = str(POISON_ID_SUBSTR).lower()
+    for i in range(N):
+        if int(y_run[i]) == 0:
+            continue
+        ids = chunk_ids_obj[i]
+        for j, cid in enumerate(ids):
+            if cid is None:
+                continue
+            if needle and needle in str(cid).lower():
+                gt[i, j] = 1
+    return gt
+
+
+# ============================================================
+# Calibration for thr_loc (benign val only, no chunk labels)
+# ============================================================
+@torch.no_grad()
+def calibrate_thr_loc_benign_only(model: nn.Module, X_val: np.ndarray, y_val: np.ndarray,
+                                  target_chunk_fpr: float) -> float:
+    model.eval()
+    X = torch.from_numpy(X_val.astype(np.float32)).to(DEVICE)
+    y = y_val.astype(np.int64)
+
+    _, s, _, _, _ = model(X)
+    s_np = s.detach().cpu().numpy()  # (N,K)
+
+    neg_scores = s_np[y == 0].reshape(-1)
+    if neg_scores.size == 0:
+        return 0.5
+
+    q = max(0.0, min(1.0, 1.0 - float(target_chunk_fpr)))
+    thr = float(np.quantile(neg_scores, q))
+    return thr
+
+
+# ============================================================
+# GATED-ONLY evaluation
+# ============================================================
+@torch.no_grad()
+def evaluate_gated_only(model: nn.Module, X_np: np.ndarray, y_np: np.ndarray, chunk_ids_obj: np.ndarray,
+                        thr_det: float, thr_loc: float,
+                        use_topr: bool = False, top_r: int = 2) -> Dict[str, Any]:
+    model.eval()
+    X = torch.from_numpy(X_np.astype(np.float32)).to(DEVICE)
+    y = y_np.astype(np.int64)
+
+    chunk_logits, s, _, y_hat, _ = model(X)
+
+    run_prob = y_hat.detach().cpu().numpy()
+    run_pred = (run_prob >= thr_det).astype(np.int64)
+
+    tp, tn, fp, fn = _counts_from_preds(y, run_pred)
+    run_report = {
+        "counts": {"tp": tp, "tn": tn, "fp": fp, "fn": fn},
+        "rates": _rates(tp, tn, fp, fn),
+        "thr_det": float(thr_det),
+        "pooling": "AttentionMIL(Ilse2018)",
+    }
+
+    s_np = s.detach().cpu().numpy()  # (N,K)
+    pred_chunk = np.zeros_like(s_np, dtype=np.int64)
+
+    if use_topr:
+        for i in range(len(s_np)):
+            if run_pred[i] == 0:
+                continue
+            idx = np.argsort(-s_np[i])[:top_r]
+            pred_chunk[i, idx] = 1
+        loc_mode = f"topr(r={top_r})"
+    else:
+        pred_chunk = (s_np >= thr_loc).astype(np.int64)
+        pred_chunk[run_pred == 0, :] = 0
+        loc_mode = f"threshold(thr_loc={thr_loc:.6f})"
+
+    gt_chunk = _chunk_gt_eval_only(y, chunk_ids_obj)
+
+    gt_f = gt_chunk.reshape(-1)
+    pr_f = pred_chunk.reshape(-1)
+
+    tp2, tn2, fp2, fn2 = _counts_from_preds(gt_f, pr_f)
+    chunk_report = {
+        "counts": {"tp": tp2, "tn": tn2, "fp": fp2, "fn": fn2},
+        "rates": _rates(tp2, tn2, fp2, fn2),
+        "localization": loc_mode,
+        "gating": "Only localize when run_pred==1",
+        "gt_rule": f"eval-only: ('{POISON_ID_SUBSTR}' in chunk_id) for malicious runs; all-0 for benign runs",
+    }
+
+    return {"run_level": run_report, "chunk_level_eval_only_gated": chunk_report}
+
+
+# ============================================================
+# Train (run-label-only) + test report (gated-only)
+# ============================================================
+def train_and_test():
+    print(f"[out] OUT_DIR = {OUT_DIR}")
+
+    if BUILD_MATRICES:
+        build_dataset_npz(force_rebuild=FORCE_REBUILD)
+
+    data = np.load(DATASET_NPZ, allow_pickle=True)
+    X = data["X"].astype(np.float32)         # (N,K,D)
+    y = data["y"].astype(np.int64)           # (N,)
+    qids = data["qids"].astype(np.int64)     # (N,)
+    chunk_ids = data["chunk_ids"]            # (N,) object
+
+    N, K_, D = X.shape
+    assert K_ == K
+    print(f"[data] X={X.shape} y={y.shape} unique_qids={len(np.unique(qids))}")
+
+    tr_mask, va_mask, te_mask = split_by_qid(qids, train=TRAIN_SPLIT, val=VAL_SPLIT, seed=SEED)
+    X_tr, y_tr = X[tr_mask], y[tr_mask]
+    X_va, y_va, ids_va = X[va_mask], y[va_mask], chunk_ids[va_mask]
+    X_te, y_te, ids_te = X[te_mask], y[te_mask], chunk_ids[te_mask]
+    print(f"[split] train={len(X_tr)} val={len(X_va)} test={len(X_te)}")
+
+    train_loader = DataLoader(RunDataset(X_tr, y_tr), batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+
+    model = MIL_SetTransformer_AttnMIL(
+        D_in=D, d_model=D_MODEL, n_heads=N_HEADS, n_layers=N_LAYERS,
+        dropout=DROPOUT, embed_dim=EMBED_DIM
+    ).to(DEVICE)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    bce = nn.BCELoss()
+
+    best_val = float("inf")
+    best_state = None
+    best_opt_state = None
+
+    for ep in range(1, EPOCHS+1):
+        model.train()
+        tot = 0.0
+        nseen = 0
+
+        for xb, yb in train_loader:
+            xb = xb.to(DEVICE)
+            yb = yb.to(DEVICE)
+            yb_f = yb.float()
+
+            opt.zero_grad(set_to_none=True)
+
+            chunk_logits, s, a, y_hat, emb = model(xb)
+
+            L_det = bce(y_hat, yb_f)
+
+            mean_s = s.mean(dim=1)
+            max_s  = s.max(dim=1).values
+            lse = torch.logsumexp(chunk_logits, dim=1) - math.log(K)
+
+            neg_mask = (1 - yb_f)
+            pos_mask = yb_f
+
+            L_neg_mean = (mean_s * neg_mask).mean()
+            L_neg_max  = (max_s  * neg_mask).mean()
+            L_neg_lse  = (torch.sigmoid(lse) * neg_mask).mean()
+
+            L_cov = (F.relu(RHO_COV - mean_s) * pos_mask).mean()
+
+            eps = 1e-9
+            ent = -(a * (a + eps).log()).sum(dim=1)
+            L_attn_ent = ((-ent) * pos_mask).mean()
+
+            if USE_SUPCON:
+                L_sc = supervised_contrastive_loss(emb, yb, tau=SUPCON_TAU)
+            else:
+                L_sc = torch.tensor(0.0, device=DEVICE)
+
+            loss = (
+                W_DET * L_det
+                + W_COV * L_cov
+                + W_NEG_MEAN * L_neg_mean
+                + W_NEG_MAX  * L_neg_max
+                + W_NEG_LSE  * L_neg_lse
+                + W_ATTN_ENT * L_attn_ent
+                + W_SUPCON * L_sc
+            )
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            opt.step()
+
+            bs = xb.size(0)
+            tot += float(loss.item()) * bs
+            nseen += bs
+
+        train_loss = tot / max(nseen, 1)
+
+        model.eval()
+        with torch.no_grad():
+            Xv = torch.from_numpy(X_va.astype(np.float32)).to(DEVICE)
+            yv = torch.from_numpy(y_va.astype(np.float32)).to(DEVICE)
+            _, _, _, yhat_v, _ = model(Xv)
+            val_loss = float(bce(yhat_v, yv).item())
+
+        print(f"[ep {ep:02d}] train_loss={train_loss:.6f} val_runBCE={val_loss:.6f}")
+
+        if val_loss < best_val - 1e-6:
+            best_val = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_opt_state = opt.state_dict()
+
+            torch.save({
+                "model_state_dict": best_state,
+                "optimizer_state_dict": best_opt_state,
+                "K": int(K),
+                "D_EXPECTED": int(D),
+                "embed_dim": int(EMBED_DIM),
+                "best_val_loss": float(best_val),
+                "seed": int(SEED),
+                "dataset": "nq",
+                "note": "GATEDONLY: SetTransformer+AttnMIL. Train/Val use RUN labels only. Chunk GT used only for TEST eval.",
+            }, BEST_CKPT_PTH)
+            print(f"  -> saved BEST: {BEST_CKPT_PTH}")
+
+    ckpt = torch.load(BEST_CKPT_PTH, map_location=DEVICE)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    if not USE_TOPR_INSTEAD_OF_THRESHOLD:
+        thr_loc_raw = calibrate_thr_loc_benign_only(
+            model, X_va, y_va, target_chunk_fpr=TARGET_CHUNK_FPR_BENIGN_VAL
+        )
+        thr_loc = float(np.clip(thr_loc_raw, MIN_THR_LOC, MAX_THR_LOC))
+    else:
+        thr_loc_raw = None
+        thr_loc = None
+
+    calib_obj = {
+        "thr_det": float(THR_DET),
+        "use_topr_instead_of_threshold": bool(USE_TOPR_INSTEAD_OF_THRESHOLD),
+        "top_r": int(TOP_R),
+        "target_chunk_fpr_benign_val": float(TARGET_CHUNK_FPR_BENIGN_VAL),
+        "thr_loc_raw": None if thr_loc_raw is None else float(thr_loc_raw),
+        "thr_loc_clamped": None if thr_loc is None else float(thr_loc),
+        "thr_loc_clamp_min": float(MIN_THR_LOC),
+        "thr_loc_clamp_max": float(MAX_THR_LOC),
+        "poison_id_substr": str(POISON_ID_SUBSTR),
+        "max_nq": None if not MAX_NQ else int(MAX_NQ),
+    }
+    with open(CALIB_JSON, "w", encoding="utf-8") as f:
+        json.dump(calib_obj, f, indent=2)
+    print(f"[calib] saved {CALIB_JSON}")
+
+    if USE_TOPR_INSTEAD_OF_THRESHOLD:
+        report = evaluate_gated_only(
+            model, X_te, y_te, ids_te,
+            thr_det=THR_DET, thr_loc=0.5,
+            use_topr=True, top_r=TOP_R
+        )
+    else:
+        report = evaluate_gated_only(
+            model, X_te, y_te, ids_te,
+            thr_det=THR_DET, thr_loc=thr_loc,
+            use_topr=False, top_r=TOP_R
+        )
+
+    print("\n=== TEST REPORT (run + chunk eval-only, GATED ONLY) ===")
+    print(report)
+
+    with open(REPORT_JSON, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    print(f"[report] saved {REPORT_JSON}")
+
+    return model, report
+
+
+# RUN
+if __name__ == "__main__":
+    train_and_test()
